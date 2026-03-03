@@ -1,0 +1,21 @@
+# Credentials – niemals einchecken!
+.env
+
+# Laufzeit-Daten
+database.db
+bot.log
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# IDE
+.claude/

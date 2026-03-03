@@ -1,0 +1,8 @@
+.env
+database.db
+bot.log
+data/
+__pycache__/
+*.pyc
+.git/
+README.md
