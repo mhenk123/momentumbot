@@ -645,9 +645,10 @@ def send_daily_report() -> None:
     else:
         open_pos_lines = "\n  _(keine offenen Positionen)_"
 
+    berlin = pytz.timezone("Europe/Berlin")
     today_sign = "+" if today_pnl >= 0 else ""
     msg = (
-        f"📋 *Daily Report* – {datetime.now().strftime('%d.%m.%Y')}\n\n"
+        f"📋 *Daily Report* – {datetime.now(berlin).strftime('%d.%m.%Y')}\n\n"
         f"🏦 *Kontostand:* ${bal:,.2f}\n"
         f"📅 *Heutiger PnL:* {today_sign}${today_pnl:,.2f}\n"
         f"📂 *Offene Positionen:* {len(open_trades)}{open_pos_lines}\n\n"
@@ -779,24 +780,47 @@ def run_ml_optimization() -> None:
 # Scheduler setup
 # ---------------------------------------------------------------------------
 
-def setup_schedule(cfg: dict) -> None:
-    """Register all recurring jobs with the `schedule` library."""
-    berlin = pytz.timezone(cfg["timezone"])
+def _berlin_to_utc(time_str: str, tz_name: str) -> str:
+    """
+    Convert a HH:MM wall-clock time in `tz_name` to the UTC equivalent.
+    Uses today's date so DST is handled correctly.
+    The result is what `schedule` needs, since the VPS runs on UTC.
+    """
+    local_tz = pytz.timezone(tz_name)
+    utc_tz   = pytz.utc
+    now_local = datetime.now(local_tz)
+    h, m = map(int, time_str.split(":"))
+    local_dt = local_tz.localize(
+        datetime(now_local.year, now_local.month, now_local.day, h, m, 0)
+    )
+    return local_dt.astimezone(utc_tz).strftime("%H:%M")
 
-    # --- Scan cycle every 15 minutes ---
+
+def setup_schedule(cfg: dict) -> None:
+    """
+    Register all recurring jobs with the `schedule` library.
+    Times in config.json are Europe/Berlin – they are converted to UTC
+    before being passed to `schedule`, which always runs on system time (UTC).
+    """
+    tz_name = cfg["timezone"]  # "Europe/Berlin"
+
+    # --- Scan cycle every 15 minutes (no timezone conversion needed) ---
     schedule.every(cfg["scan_interval_minutes"]).minutes.do(run_scan_cycle)
 
-    # --- Daily report ---
-    daily_time = cfg.get("daily_report_time", "18:30")
-    schedule.every().day.at(daily_time).do(send_daily_report)
+    # --- Daily report: convert Berlin time → UTC ---
+    daily_time_berlin = cfg.get("daily_report_time", "18:30")
+    daily_time_utc    = _berlin_to_utc(daily_time_berlin, tz_name)
+    schedule.every().day.at(daily_time_utc).do(send_daily_report)
 
-    # --- Weekly ML optimisation ---
-    ml_time = cfg.get("ml_optimization_time", "20:00")
-    schedule.every().sunday.at(ml_time).do(run_ml_optimization)
+    # --- Weekly ML optimisation: convert Berlin time → UTC ---
+    ml_time_berlin = cfg.get("ml_optimization_time", "20:00")
+    ml_time_utc    = _berlin_to_utc(ml_time_berlin, tz_name)
+    schedule.every().sunday.at(ml_time_utc).do(run_ml_optimization)
 
     log.info(
         f"Scheduler ready: scan every {cfg['scan_interval_minutes']}min | "
-        f"daily report at {daily_time} | ML every Sunday at {ml_time}"
+        f"daily report at {daily_time_berlin} Berlin ({daily_time_utc} UTC) | "
+        f"ML every Sunday at {ml_time_berlin} Berlin ({ml_time_utc} UTC)"
     )
 
 
