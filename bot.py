@@ -32,8 +32,8 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-CONFIG_PATH = "config.json"
-DB_PATH     = "database.db"
+CONFIG_PATH = "data/config.json"
+DB_PATH     = "data/database.db"
 
 logging.basicConfig(
     level=logging.INFO,

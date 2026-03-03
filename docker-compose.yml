@@ -2,15 +2,15 @@ services:
   momentumbot:
     build: .
     container_name: momentumbot
-    restart: unless-stopped        # startet automatisch neu nach Absturz oder Server-Reboot
+    restart: unless-stopped
     env_file:
-      - .env                       # Telegram-Credentials werden zur Laufzeit geladen
+      - .env
     volumes:
-      - ./data/config.json:/app/config.json   # config.json persistent (Balance, ML-Updates)
-      - ./data/database.db:/app/database.db   # SQLite-Datenbank persistent
-      - ./data/bot.log:/app/bot.log           # Logs persistent
+      # Ganzes data/-Verzeichnis mounten – keine einzelnen Datei-Mounts mehr.
+      # Docker erstellt das Verzeichnis auf dem Host automatisch falls nötig.
+      - ./data:/app/data
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"            # Log-Rotation: max 10 MB pro Datei
-        max-file: "3"              # max 3 rotierte Log-Dateien
+        max-size: "10m"
+        max-file: "3"

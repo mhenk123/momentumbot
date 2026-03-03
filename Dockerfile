@@ -1,17 +1,21 @@
 FROM python:3.11-slim
 
-# Arbeitsverzeichnis im Container
 WORKDIR /app
 
 # Zuerst nur requirements kopieren (besseres Layer-Caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Restliche Projektdateien kopieren
+# Bot und Standard-Config ins Image kopieren
 COPY bot.py .
-COPY config.json .
+COPY entrypoint.sh .
+# config.json als unveränderter Default – das entrypoint.sh kopiert sie
+# beim ersten Start nach data/config.json (persistentes Volume)
+COPY config.json config.default.json
 
-# .env wird NICHT ins Image kopiert – wird zur Laufzeit als Volume eingehängt
-# database.db und bot.log entstehen erst zur Laufzeit
+RUN chmod +x entrypoint.sh
 
-CMD ["python", "-u", "bot.py"]
+# data/ wird als Volume gemountet – kein Datei-Mount mehr nötig
+VOLUME ["/app/data"]
+
+ENTRYPOINT ["./entrypoint.sh"]
