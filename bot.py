@@ -218,8 +218,13 @@ def db_get_today_pnl() -> float:
 # ---------------------------------------------------------------------------
 
 HL_API_URL = "https://api.hyperliquid.xyz/info"
-_CANDLE_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}  # symbol -> (timestamp, df)
+_CANDLE_CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}  # (symbol, interval) -> (timestamp, df)
 CACHE_TTL = 60 * 14  # cache candles for ~14 minutes (refresh each scan cycle)
+
+# Standard lookback per interval so callers don't need to think about it:
+# 15m → 24h gives 96 candles (enough for 24h volume baseline + RSI14)
+# 4h  → 90h gives ~22 candles (enough for SMA20)
+_INTERVAL_LOOKBACK = {"15m": 24, "4h": 90}
 
 
 def hl_post(payload: dict, retries: int = 3, backoff: float = 5.0) -> dict | list | None:
@@ -251,18 +256,25 @@ def get_all_perp_meta() -> list[dict]:
     return []
 
 
-def get_candles(symbol: str, interval: str = "15m", lookback_hours: int = 4) -> pd.DataFrame | None:
+def get_candles(symbol: str, interval: str = "15m", lookback_hours: int | None = None) -> pd.DataFrame | None:
     """
     Fetch OHLCV candles for `symbol` from Hyperliquid.
     Returns a DataFrame with columns: time, open, high, low, close, volume.
-    Uses a short in-memory cache to avoid hammering the API during scans.
+    Uses a short in-memory cache (keyed by symbol+interval) to avoid
+    hammering the API during scans.
+    lookback_hours defaults to _INTERVAL_LOOKBACK[interval] if not given.
     """
     global _CANDLE_CACHE
     now_ts = time.time()
 
+    if lookback_hours is None:
+        lookback_hours = _INTERVAL_LOOKBACK.get(interval, 24)
+
+    cache_key = (symbol, interval)
+
     # Return cached data if still fresh
-    if symbol in _CANDLE_CACHE:
-        cached_at, cached_df = _CANDLE_CACHE[symbol]
+    if cache_key in _CANDLE_CACHE:
+        cached_at, cached_df = _CANDLE_CACHE[cache_key]
         if now_ts - cached_at < CACHE_TTL:
             return cached_df
 
@@ -295,7 +307,7 @@ def get_candles(symbol: str, interval: str = "15m", lookback_hours: int = 4) -> 
         df.reset_index(drop=True, inplace=True)
         if df.empty:
             return None
-        _CANDLE_CACHE[symbol] = (now_ts, df)
+        _CANDLE_CACHE[cache_key] = (now_ts, df)
         return df
     except Exception as e:
         log.error(f"Failed to parse candles for {symbol}: {e}")
@@ -360,84 +372,201 @@ def calc_price_change_pct(closes: pd.Series) -> float:
         return 0.0
     return float((closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100)
 
+
+def calc_rsi_series(closes: pd.Series, period: int = 14) -> pd.Series | None:
+    """Wilder RSI – returns the full series (needed for slope calculation)."""
+    if len(closes) < period + 1:
+        return None
+    delta    = closes.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs  = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi if not rsi.empty else None
+
+
+def calc_sma(series: pd.Series, period: int) -> float | None:
+    """Simple Moving Average of the last `period` values."""
+    if len(series) < period:
+        return None
+    return float(series.rolling(period).mean().iloc[-1])
+
+
+def calc_atr(df: pd.DataFrame, period: int = 14) -> float | None:
+    """Average True Range over the last `period` candles."""
+    if len(df) < period + 1:
+        return None
+    high       = df["high"]
+    low        = df["low"]
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.rolling(period).mean()
+    val = atr.iloc[-1]
+    return float(val) if not np.isnan(val) else None
+
 # ---------------------------------------------------------------------------
 # Scanner – find best momentum candidate
 # ---------------------------------------------------------------------------
 
 def scan_market(cfg: dict) -> dict | None:
     """
-    Scan all Hyperliquid perpetuals, apply RSI filter, and return
-    the best momentum candidate (or None if nothing qualifies).
+    Multi-timeframe momentum scanner.
 
-    Returns a dict with: symbol, price, rsi, volume_chg_pct,
-    price_chg_4h, btc_trend_pct
+    Filter  (4h):  Price must be above SMA20 – confirms uptrend.
+    Trigger (15m): Breakout confirmed by volume surge, ATR-relative
+                   price acceleration, and RSI in the 55–70 window.
+
+    Scoring (0–100, normalised across all passing candidates):
+        Score = price_ratio*0.4 + vol_ratio*0.4 + rsi_slope*0.2
     """
     log.info("Starting market scan …")
-    rsi_limit     = cfg["rsi_overbought_limit"]
-    lookback_h    = cfg["lookback_hours"]
-    rsi_period    = cfg["rsi_period"]
 
-    # --- Fetch BTC trend as reference ---
-    btc_df = get_candles("BTC", lookback_hours=lookback_h)
-    btc_trend = calc_price_change_pct(btc_df["close"]) if btc_df is not None and not btc_df.empty else 0.0
+    rsi_min    = cfg.get("rsi_min_limit", 55)
+    rsi_max    = cfg.get("rsi_overbought_limit", 70)
+    rsi_period = cfg["rsi_period"]
+    atr_period = cfg.get("atr_period", 14)
+    atr_factor = cfg.get("atr_price_chg_min_factor", 0.5)
+    vol_mult   = cfg.get("volume_surge_multiplier", 1.5)
+    sma_period = cfg.get("sma_period_4h", 20)
 
-    # --- Fetch all current mid prices ---
+    # --- BTC 4h trend as market reference ---
+    btc_4h    = get_candles("BTC", interval="4h")
+    btc_trend = calc_price_change_pct(btc_4h["close"]) if btc_4h is not None else 0.0
+
+    # --- Current mid prices ---
     all_mids = get_all_mids()
     if not all_mids:
         log.warning("Could not fetch mid prices – aborting scan.")
         return None
 
-    open_trades = db_get_open_trades()
-    open_symbols = {t["symbol"] for t in open_trades}
+    open_symbols = {t["symbol"] for t in db_get_open_trades()}
 
-    # Score all eligible symbols
-    candidates = []
-    meta = get_all_perp_meta()
-    symbols = [m["name"] for m in meta if m.get("name") and m["name"] != "BTC"]
-
-    # Limit to symbols that have a mid price (i.e. actively traded)
+    meta    = get_all_perp_meta()
+    symbols = [m["name"] for m in meta if m.get("name") and m["name"] not in ("BTC", "@107", "@108")]
     symbols = [s for s in symbols if s in all_mids]
+
+    candidates = []
 
     for symbol in symbols:
         if symbol in open_symbols:
-            continue  # already have a position
-
-        # Small sleep to be polite with API rate limits
-        time.sleep(0.15)
-
-        df = get_candles(symbol, lookback_hours=lookback_h)
-        if df is None or len(df) < rsi_period + 2:
             continue
 
-        rsi = calc_rsi(df["close"], period=rsi_period)
-        if rsi is None or rsi > rsi_limit:
-            continue  # overbought or no data
+        time.sleep(0.15)  # be polite with the API
 
-        vol_chg  = calc_volume_change_pct(df["volume"])
-        price_chg = calc_price_change_pct(df["close"])
+        # ── 4h TREND FILTER: price above SMA20(4h) ────────────────────────
+        df_4h = get_candles(symbol, interval="4h")
+        if df_4h is None or len(df_4h) < sma_period:
+            log.debug(f"Signal für {symbol} abgelehnt: zu wenig 4h-Daten")
+            continue
 
-        # Composite momentum score: weight volume more, price confirms
-        score = vol_chg * 0.6 + price_chg * 0.4
+        sma_20       = calc_sma(df_4h["close"], sma_period)
+        price_now_4h = float(df_4h["close"].iloc[-1])
+        if sma_20 is None or price_now_4h < sma_20:
+            log.info(
+                f"Signal für {symbol} abgelehnt: Kurs unter SMA20(4h) "
+                f"({price_now_4h:.4f} < {sma_20:.4f})"
+            )
+            continue
 
-        if price_chg > 0 and vol_chg > 0:  # must have positive momentum on both
-            candidates.append({
-                "symbol":        symbol,
-                "price":         all_mids[symbol],
-                "rsi":           rsi,
-                "volume_chg_pct": vol_chg,
-                "price_chg_4h":  price_chg,
-                "btc_trend_pct": btc_trend,
-                "score":         score,
-            })
+        # ── 15m SIGNAL ────────────────────────────────────────────────────
+        df_15m = get_candles(symbol, interval="15m")
+        min_candles = max(rsi_period + 5, atr_period + 5)
+        if df_15m is None or len(df_15m) < min_candles:
+            log.debug(f"Signal für {symbol} abgelehnt: zu wenig 15m-Daten")
+            continue
+
+        # RSI-Fenster: 55 ≤ RSI ≤ 70
+        rsi_series = calc_rsi_series(df_15m["close"], period=rsi_period)
+        if rsi_series is None:
+            continue
+        rsi = float(rsi_series.iloc[-1])
+
+        if rsi < rsi_min:
+            log.info(f"Signal für {symbol} abgelehnt: RSI zu niedrig ({rsi:.1f} < {rsi_min})")
+            continue
+        if rsi > rsi_max:
+            log.info(f"Signal für {symbol} abgelehnt: RSI zu hoch ({rsi:.1f} > {rsi_max})")
+            continue
+
+        # Volumen-Explosion: letzte Kerze > 24h-Durchschnitt × Multiplikator
+        avg_vol  = float(df_15m["volume"].iloc[:-1].mean())
+        last_vol = float(df_15m["volume"].iloc[-1])
+        vol_threshold = avg_vol * vol_mult
+        if avg_vol == 0 or last_vol < vol_threshold:
+            log.info(
+                f"Signal für {symbol} abgelehnt: Volumen zu niedrig "
+                f"({last_vol:.0f} < {vol_threshold:.0f} = avg×{vol_mult})"
+            )
+            continue
+
+        # Preis-Beschleunigung: letzte Kerze muss > ATR × Faktor steigen
+        atr = calc_atr(df_15m, period=atr_period)
+        if atr is None or atr == 0:
+            log.debug(f"Signal für {symbol} abgelehnt: ATR nicht berechenbar")
+            continue
+        last_candle_move = float(df_15m["close"].iloc[-1]) - float(df_15m["close"].iloc[-2])
+        atr_threshold    = atr * atr_factor
+        if last_candle_move < atr_threshold:
+            log.info(
+                f"Signal für {symbol} abgelehnt: Preisbewegung zu schwach "
+                f"({last_candle_move:.6f} < ATR×{atr_factor} = {atr_threshold:.6f})"
+            )
+            continue
+
+        # RSI-Slope: Dynamik des RSI über 3 Kerzen
+        rsi_slope = (
+            float(rsi_series.iloc[-1]) - float(rsi_series.iloc[-4])
+            if len(rsi_series) >= 4 else 0.0
+        )
+        vol_chg_pct  = (last_vol - avg_vol) / avg_vol * 100
+        price_chg_4h = calc_price_change_pct(df_15m["close"])  # for DB + reporting
+
+        log.info(
+            f"Signal für {symbol} erkannt: RSI={rsi:.1f} (Slope={rsi_slope:+.1f}) "
+            f"| Vol+{vol_chg_pct:.0f}% | Kerze={last_candle_move:.6f} ATR={atr:.6f}"
+        )
+
+        candidates.append({
+            "symbol":          symbol,
+            "price":           all_mids[symbol],
+            "rsi":             rsi,
+            "volume_chg_pct":  vol_chg_pct,
+            "price_chg_4h":    price_chg_4h,
+            "btc_trend_pct":   btc_trend,
+            "rsi_slope":       rsi_slope,
+            # raw ratios used for normalised scoring
+            "_price_ratio":    last_candle_move / atr,
+            "_vol_ratio":      last_vol / avg_vol,
+        })
 
     if not candidates:
-        log.info("No qualifying momentum candidates found.")
+        log.info("Kein qualifizierender Kandidat gefunden.")
         return None
+
+    # ── SCORING: normalise each component to [0, 100] across candidates ──
+    def _norm(values: list[float]) -> list[float]:
+        lo, hi = min(values), max(values)
+        if hi == lo:
+            return [50.0] * len(values)
+        return [(v - lo) / (hi - lo) * 100 for v in values]
+
+    price_norm = _norm([c["_price_ratio"] for c in candidates])
+    vol_norm   = _norm([c["_vol_ratio"]   for c in candidates])
+    slope_norm = _norm([c["rsi_slope"]    for c in candidates])
+
+    for i, c in enumerate(candidates):
+        c["score"] = round(price_norm[i] * 0.4 + vol_norm[i] * 0.4 + slope_norm[i] * 0.2, 1)
 
     best = max(candidates, key=lambda x: x["score"])
     log.info(
-        f"Best candidate: {best['symbol']} | RSI={best['rsi']:.1f} "
-        f"| VolChg={best['volume_chg_pct']:.1f}% | PriceChg={best['price_chg_4h']:.1f}%"
+        f"Bester Kandidat: {best['symbol']} | Score={best['score']} "
+        f"| RSI={best['rsi']:.1f} (Slope={best['rsi_slope']:+.1f}) "
+        f"| Vol+{best['volume_chg_pct']:.0f}%"
     )
     return best
 
@@ -483,8 +612,9 @@ def open_trade(candidate: dict, cfg: dict) -> None:
 
     msg = (
         f"🟢 *PAPER-TRADE:* LONG {candidate['symbol']} bei ${candidate['price']:.4f}\n"
-        f"📊 Grund: RSI={candidate['rsi']:.1f} | Volumen +{candidate['volume_chg_pct']:.1f}% "
-        f"| Kurs +{candidate['price_chg_4h']:.1f}% (4h)\n"
+        f"📊 Score: *{candidate.get('score', '–')}* | "
+        f"RSI={candidate['rsi']:.1f} (Slope={candidate.get('rsi_slope', 0):+.1f}) "
+        f"| Vol+{candidate['volume_chg_pct']:.0f}% | Kurs+{candidate['price_chg_4h']:.1f}% (24h)\n"
         f"💵 Positionsgröße: ${size_usd:,.2f} | Stop-Loss: ${stop_price:.4f}"
     )
     send_telegram(msg)
